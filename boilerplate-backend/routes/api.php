@@ -7,6 +7,7 @@ use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\Auth\EmailVerificationController;
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\Admin\SettingsController;
 
 /*
 |--------------------------------------------------------------------------
@@ -26,6 +27,9 @@ Route::post('/forgot-password', [PasswordResetController::class, 'forgotPassword
 Route::post('/reset-password', [PasswordResetController::class, 'resetPassword']);
 Route::post('/verify-email', [EmailVerificationController::class, 'verify']);
 Route::post('/resend-verification', [EmailVerificationController::class, 'resend']);
+
+// Public settings route
+Route::get('/settings/public', [SettingsController::class, 'getPublicSettings']);
 
 // Protected routes
 Route::middleware('auth:sanctum')->group(function () {
@@ -68,6 +72,14 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('/{user}', [UserController::class, 'show']);
             Route::put('/{user}', [UserController::class, 'update']);
             Route::delete('/{user}', [UserController::class, 'destroy']);
+        });
+
+        // Settings routes
+        Route::prefix('settings')->group(function () {
+            Route::get('/', [SettingsController::class, 'index']);
+            Route::get('/{group}', [SettingsController::class, 'getByGroup']);
+            Route::put('/', [SettingsController::class, 'update']);
+            Route::post('/reset', [SettingsController::class, 'reset']);
         });
     });
 });
