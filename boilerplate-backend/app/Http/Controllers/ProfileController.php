@@ -1,0 +1,373 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use PragmaRX\Google2FA\Google2FA;
+use SimpleSoftwareIO\QrCode\Facades\QrCode;
+
+class ProfileController extends Controller
+{
+    /**
+     * Get user profile
+     */
+    public function show(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'user' => $user
+            ]
+        ]);
+    }
+
+    /**
+     * Update user profile
+     */
+    public function update(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'name' => 'sometimes|required|string|max:255',
+            'email' => 'sometimes|required|email|unique:users,email,' . $request->user()->id,
+            'phone' => 'sometimes|nullable|string|max:20',
+            'bio' => 'sometimes|nullable|string|max:1000',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $user = $request->user();
+        $user->update($request->only(['name', 'email', 'phone', 'bio']));
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Profile updated successfully',
+            'data' => [
+                'user' => $user->fresh()
+            ]
+        ]);
+    }
+
+    /**
+     * Upload profile image
+     */
+    public function uploadImage(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'image' => 'required|image|mimes:jpeg,png,jpg,gif|max:2048'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $user = $request->user();
+
+        // Delete old image if exists
+        if ($user->profile_image) {
+            Storage::disk('public')->delete($user->profile_image);
+        }
+
+        // Store new image
+        $image = $request->file('image');
+        $filename = 'profile-images/' . time() . '_' . Str::random(10) . '.' . $image->getClientOriginalExtension();
+        $path = $image->storeAs('public/' . $filename);
+
+        $user->update(['profile_image' => $filename]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Profile image uploaded successfully',
+            'data' => [
+                'user' => $user->fresh(),
+                'image_url' => $user->profile_image_url
+            ]
+        ]);
+    }
+
+    /**
+     * Remove profile image
+     */
+    public function removeImage(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if ($user->profile_image) {
+            Storage::disk('public')->delete($user->profile_image);
+            $user->update(['profile_image' => null]);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Profile image removed successfully',
+            'data' => [
+                'user' => $user->fresh()
+            ]
+        ]);
+    }
+
+    /**
+     * Change password
+     */
+    public function changePassword(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'current_password' => 'required|string',
+            'password' => 'required|string|min:8|confirmed',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $user = $request->user();
+
+        if (!Hash::check($request->current_password, $user->password)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Current password is incorrect'
+            ], 400);
+        }
+
+        $user->update(['password' => Hash::make($request->password)]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Password changed successfully'
+        ]);
+    }
+
+    /**
+     * Enable 2FA
+     */
+    public function enableTwoFactor(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if ($user->hasTwoFactorEnabled()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => '2FA is already enabled'
+            ], 400);
+        }
+
+        $google2fa = new Google2FA();
+        $secret = $google2fa->generateSecretKey();
+
+        $user->update([
+            'two_factor_secret' => $secret,
+            'two_factor_enabled' => true
+        ]);
+
+        $qrCodeUrl = $google2fa->getQRCodeUrl(
+            config('app.name'),
+            $user->email,
+            $secret
+        );
+
+        // Generate QR code as base64 image
+        $qrCodeImage = QrCode::format('png')
+            ->size(200)
+            ->margin(1)
+            ->generate($qrCodeUrl);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => '2FA setup initiated',
+            'data' => [
+                'secret' => $secret,
+                'qr_code_image' => 'data:image/png;base64,' . base64_encode($qrCodeImage),
+                'qr_code_url' => $qrCodeUrl
+            ]
+        ]);
+    }
+
+    /**
+     * Confirm 2FA setup
+     */
+    public function confirmTwoFactor(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'code' => 'required|string|size:6'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $user = $request->user();
+
+        if (!$user->two_factor_secret) {
+            return response()->json([
+                'status' => 'error',
+                'message' => '2FA setup not initiated'
+            ], 400);
+        }
+
+        $google2fa = new Google2FA();
+        $valid = $google2fa->verifyKey($user->two_factor_secret, $request->code);
+
+        if (!$valid) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Invalid 2FA code'
+            ], 400);
+        }
+
+        $user->update(['two_factor_confirmed_at' => now()]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => '2FA enabled successfully',
+            'data' => [
+                'user' => $user->fresh()
+            ]
+        ]);
+    }
+
+    /**
+     * Disable 2FA
+     */
+    public function disableTwoFactor(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        // Debug: Log the current 2FA status
+        Log::info('2FA Disable Request', [
+            'user_id' => $user->id,
+            'two_factor_enabled' => $user->two_factor_enabled,
+            'two_factor_secret' => $user->two_factor_secret ? 'exists' : 'null',
+            'two_factor_confirmed_at' => $user->two_factor_confirmed_at,
+            'hasTwoFactorEnabled' => $user->hasTwoFactorEnabled()
+        ]);
+
+        // Allow disabling if 2FA is enabled (even if not confirmed) or if there's a secret
+        if (!$user->two_factor_enabled && !$user->two_factor_secret) {
+            return response()->json([
+                'status' => 'error',
+                'message' => '2FA is not enabled'
+            ], 400);
+        }
+
+        $user->update([
+            'two_factor_secret' => null,
+            'two_factor_enabled' => false,
+            'two_factor_confirmed_at' => null
+        ]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => '2FA disabled successfully',
+            'data' => [
+                'user' => $user->fresh()
+            ]
+        ]);
+    }
+
+    /**
+     * Get 2FA status
+     */
+    public function getTwoFactorStatus(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'two_factor_enabled' => $user->hasTwoFactorEnabled(),
+                'two_factor_setup' => $user->two_factor_enabled && !$user->two_factor_confirmed_at
+            ]
+        ]);
+    }
+
+    /**
+     * Generate QR code for 2FA
+     */
+    public function generateQrCode(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$user->two_factor_secret) {
+            return response()->json([
+                'status' => 'error',
+                'message' => '2FA setup not initiated'
+            ], 400);
+        }
+
+        $google2fa = new Google2FA();
+        $qrCodeUrl = $google2fa->getQRCodeUrl(
+            config('app.name'),
+            $user->email,
+            $user->two_factor_secret
+        );
+
+        // Generate QR code as base64 image
+        $qrCodeImage = QrCode::format('png')
+            ->size(200)
+            ->margin(1)
+            ->generate($qrCodeUrl);
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'qr_code_image' => 'data:image/png;base64,' . base64_encode($qrCodeImage),
+                'qr_code_url' => $qrCodeUrl
+            ]
+        ]);
+    }
+
+    /**
+     * Cancel 2FA setup
+     */
+    public function cancelTwoFactorSetup(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        // Only allow canceling if 2FA is enabled but not confirmed
+        if (!$user->two_factor_enabled || $user->two_factor_confirmed_at) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Cannot cancel 2FA setup'
+            ], 400);
+        }
+
+        $user->update([
+            'two_factor_secret' => null,
+            'two_factor_enabled' => false,
+            'two_factor_confirmed_at' => null
+        ]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => '2FA setup canceled successfully',
+            'data' => [
+                'user' => $user->fresh()
+            ]
+        ]);
+    }
+}
