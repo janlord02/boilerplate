@@ -66,11 +66,21 @@ class ProfileController extends Controller
      */
     public function uploadImage(Request $request): JsonResponse
     {
+        Log::info('Profile image upload started', [
+            'user_id' => $request->user()->id,
+            'has_file' => $request->hasFile('image'),
+            'file_name' => $request->file('image')?->getClientOriginalName(),
+            'file_size' => $request->file('image')?->getSize(),
+        ]);
+
         $validator = Validator::make($request->all(), [
             'image' => 'required|image|mimes:jpeg,png,jpg,gif|max:2048'
         ]);
 
         if ($validator->fails()) {
+            Log::error('Profile image upload validation failed', [
+                'errors' => $validator->errors()
+            ]);
             return response()->json([
                 'status' => 'error',
                 'message' => 'Validation failed',
@@ -82,15 +92,52 @@ class ProfileController extends Controller
 
         // Delete old image if exists
         if ($user->profile_image) {
+            Log::info('Deleting old profile image', ['old_path' => $user->profile_image]);
             Storage::disk('public')->delete($user->profile_image);
         }
 
         // Store new image
         $image = $request->file('image');
         $filename = 'profile-images/' . time() . '_' . Str::random(10) . '.' . $image->getClientOriginalExtension();
-        $path = $image->storeAs('public/' . $filename);
+
+        Log::info('Attempting to store image', [
+            'filename' => $filename,
+            'original_name' => $image->getClientOriginalName(),
+            'size' => $image->getSize(),
+            'mime_type' => $image->getMimeType(),
+        ]);
+
+        try {
+            $path = $image->storeAs($filename, '', 'public');
+            Log::info('Image stored successfully', ['path' => $path]);
+        } catch (\Exception $e) {
+            Log::error('Failed to store image', [
+                'error' => $e->getMessage(),
+                'filename' => $filename
+            ]);
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to store image: ' . $e->getMessage()
+            ], 500);
+        }
+
+        // Check if file actually exists
+        if (!Storage::disk('public')->exists($filename)) {
+            Log::error('File does not exist after storage', ['filename' => $filename]);
+            return response()->json([
+                'status' => 'error',
+                'message' => 'File was not stored properly'
+            ], 500);
+        }
 
         $user->update(['profile_image' => $filename]);
+
+        Log::info('Profile image upload completed', [
+            'user_id' => $user->id,
+            'profile_image' => $filename,
+            'file_exists' => Storage::disk('public')->exists($filename),
+            'file_size' => Storage::disk('public')->size($filename),
+        ]);
 
         return response()->json([
             'status' => 'success',
