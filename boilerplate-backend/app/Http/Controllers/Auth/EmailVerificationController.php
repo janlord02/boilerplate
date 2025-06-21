@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Services\ActivityService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
@@ -65,6 +66,9 @@ class EmailVerificationController extends Controller
 
         $user->markEmailAsVerified();
 
+        // Log email verification
+        ActivityService::logEmailVerification($user);
+
         return response()->json([
             'status' => 'success',
             'message' => 'Email verified successfully.',
@@ -100,6 +104,9 @@ class EmailVerificationController extends Controller
         }
 
         $user->markEmailAsVerified();
+
+        // Log email verification
+        ActivityService::logEmailVerification($user);
 
         return redirect($frontendUrl . '/auth/login?verified=success');
     }
