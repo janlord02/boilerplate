@@ -4,11 +4,13 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Services\ActivityService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
+use App\Models\Setting;
 
 class UserController extends Controller
 {
@@ -82,10 +84,33 @@ class UserController extends Controller
      */
     public function store(Request $request)
     {
+        // Get password requirements from settings
+        $minPasswordLength = Setting::getValue('min_password_length', 8);
+        $requireUppercase = Setting::getValue('require_uppercase', true);
+        $requireLowercase = Setting::getValue('require_lowercase', true);
+        $requireNumbers = Setting::getValue('require_numbers', true);
+        $requireSymbols = Setting::getValue('require_symbols', false);
+
+        // Build password validation rules
+        $passwordRules = ['required', 'string', "min:{$minPasswordLength}"];
+
+        if ($requireUppercase) {
+            $passwordRules[] = 'regex:/[A-Z]/';
+        }
+        if ($requireLowercase) {
+            $passwordRules[] = 'regex:/[a-z]/';
+        }
+        if ($requireNumbers) {
+            $passwordRules[] = 'regex:/[0-9]/';
+        }
+        if ($requireSymbols) {
+            $passwordRules[] = 'regex:/[^A-Za-z0-9]/';
+        }
+
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|string|email|max:255|unique:users',
-            'password' => ['required', Password::defaults()],
+            'password' => $passwordRules,
             'role' => ['required', Rule::in(['user', 'super-admin'])],
             'phone' => 'nullable|string|max:20',
             'bio' => 'nullable|string|max:1000',
@@ -99,6 +124,18 @@ class UserController extends Controller
             'phone' => $request->phone,
             'bio' => $request->bio,
         ]);
+
+        // Log user creation
+        ActivityService::logAdminAction(
+            $request->user(),
+            'User Created',
+            "Admin created user: {$user->name} ({$user->email})",
+            [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+                'user_role' => $user->role,
+            ]
+        );
 
         return response()->json([
             'message' => 'User created successfully',
@@ -121,6 +158,29 @@ class UserController extends Controller
      */
     public function update(Request $request, User $user)
     {
+        // Get password requirements from settings
+        $minPasswordLength = Setting::getValue('min_password_length', 8);
+        $requireUppercase = Setting::getValue('require_uppercase', true);
+        $requireLowercase = Setting::getValue('require_lowercase', true);
+        $requireNumbers = Setting::getValue('require_numbers', true);
+        $requireSymbols = Setting::getValue('require_symbols', false);
+
+        // Build password validation rules
+        $passwordRules = ['nullable', 'string', "min:{$minPasswordLength}"];
+
+        if ($requireUppercase) {
+            $passwordRules[] = 'regex:/[A-Z]/';
+        }
+        if ($requireLowercase) {
+            $passwordRules[] = 'regex:/[a-z]/';
+        }
+        if ($requireNumbers) {
+            $passwordRules[] = 'regex:/[0-9]/';
+        }
+        if ($requireSymbols) {
+            $passwordRules[] = 'regex:/[^A-Za-z0-9]/';
+        }
+
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => [
@@ -130,11 +190,16 @@ class UserController extends Controller
                 'max:255',
                 Rule::unique('users')->ignore($user->id),
             ],
-            'password' => ['nullable', Password::defaults()],
+            'password' => $passwordRules,
             'role' => ['required', Rule::in(['user', 'super-admin'])],
             'phone' => 'nullable|string|max:20',
             'bio' => 'nullable|string|max:1000',
         ]);
+
+        // Store old values for logging
+        $oldName = $user->name;
+        $oldEmail = $user->email;
+        $oldRole = $user->role;
 
         $updateData = [
             'name' => $request->name,
@@ -150,6 +215,28 @@ class UserController extends Controller
         }
 
         $user->update($updateData);
+
+        // Log user update
+        $changes = [];
+        if ($oldName !== $user->name)
+            $changes[] = 'name';
+        if ($oldEmail !== $user->email)
+            $changes[] = 'email';
+        if ($oldRole !== $user->role)
+            $changes[] = 'role';
+        if ($request->filled('password'))
+            $changes[] = 'password';
+
+        ActivityService::logAdminAction(
+            $request->user(),
+            'User Updated',
+            "Admin updated user: {$user->name} ({$user->email}) - Changed: " . implode(', ', $changes),
+            [
+                'user_id' => $user->id,
+                'user_email' => $user->email,
+                'changes' => $changes,
+            ]
+        );
 
         return response()->json([
             'message' => 'User updated successfully',
@@ -169,12 +256,27 @@ class UserController extends Controller
             ], 422);
         }
 
+        // Store user info for logging before deletion
+        $userName = $user->name;
+        $userEmail = $user->email;
+
         // Delete profile image if exists
         if ($user->profile_image) {
             Storage::disk('public')->delete($user->profile_image);
         }
 
         $user->delete();
+
+        // Log user deletion
+        ActivityService::logAdminAction(
+            $request->user(),
+            'User Deleted',
+            "Admin deleted user: {$userName} ({$userEmail})",
+            [
+                'deleted_user_name' => $userName,
+                'deleted_user_email' => $userEmail,
+            ]
+        );
 
         return response()->json([
             'message' => 'User deleted successfully',
@@ -231,6 +333,14 @@ class UserController extends Controller
         }
 
         $users = $query->get();
+        $exportCount = $users->count();
+
+        // Log the export action
+        ActivityService::logUserExport(
+            $request->user(),
+            $request->only(['search', 'role', 'status']),
+            $exportCount
+        );
 
         $filename = 'users_export_' . now()->format('Y-m-d_H-i-s') . '.csv';
         $headers = [
@@ -298,33 +408,77 @@ class UserController extends Controller
         }
 
         $users = User::whereIn('id', $userIds);
+        $affectedUsers = $users->get();
 
         switch ($action) {
             case 'delete':
                 // Delete profile images
-                $usersToDelete = $users->get();
-                foreach ($usersToDelete as $user) {
+                foreach ($affectedUsers as $user) {
                     if ($user->profile_image) {
                         Storage::disk('public')->delete($user->profile_image);
                     }
                 }
                 $users->delete();
                 $message = 'Users deleted successfully';
+
+                // Log bulk deletion
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk User Deletion',
+                    "Admin deleted {$affectedUsers->count()} users",
+                    [
+                        'deleted_count' => $affectedUsers->count(),
+                        'deleted_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             case 'verify':
                 $users->update(['email_verified_at' => now()]);
                 $message = 'Users verified successfully';
+
+                // Log bulk verification
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk User Verification',
+                    "Admin verified {$affectedUsers->count()} users",
+                    [
+                        'verified_count' => $affectedUsers->count(),
+                        'verified_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             case 'unverify':
                 $users->update(['email_verified_at' => null]);
                 $message = 'Users unverified successfully';
+
+                // Log bulk unverification
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk User Unverification',
+                    "Admin unverified {$affectedUsers->count()} users",
+                    [
+                        'unverified_count' => $affectedUsers->count(),
+                        'unverified_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             case 'enable_2fa':
                 $users->update(['two_factor_enabled' => true]);
                 $message = '2FA enabled for users successfully';
+
+                // Log bulk 2FA enable
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk 2FA Enable',
+                    "Admin enabled 2FA for {$affectedUsers->count()} users",
+                    [
+                        'enabled_count' => $affectedUsers->count(),
+                        'enabled_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             case 'disable_2fa':
@@ -334,11 +488,34 @@ class UserController extends Controller
                     'two_factor_confirmed_at' => null,
                 ]);
                 $message = '2FA disabled for users successfully';
+
+                // Log bulk 2FA disable
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk 2FA Disable',
+                    "Admin disabled 2FA for {$affectedUsers->count()} users",
+                    [
+                        'disabled_count' => $affectedUsers->count(),
+                        'disabled_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             case 'change_role':
                 $users->update(['role' => $request->role]);
                 $message = 'User roles updated successfully';
+
+                // Log bulk role change
+                ActivityService::logAdminAction(
+                    $request->user(),
+                    'Bulk Role Change',
+                    "Admin changed role to '{$request->role}' for {$affectedUsers->count()} users",
+                    [
+                        'new_role' => $request->role,
+                        'affected_count' => $affectedUsers->count(),
+                        'affected_users' => $affectedUsers->pluck('email')->toArray(),
+                    ]
+                );
                 break;
 
             default:
