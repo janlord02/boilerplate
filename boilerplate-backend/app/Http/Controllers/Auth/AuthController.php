@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Models\Setting;
+use App\Services\ActivityService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
@@ -18,10 +20,42 @@ class AuthController extends Controller
      */
     public function register(Request $request): JsonResponse
     {
+        // Check if registration is enabled
+        $registrationEnabled = Setting::getValue('registration_enabled', true);
+        if (!$registrationEnabled) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'User registration is currently disabled.'
+            ], 403);
+        }
+
+        // Get password requirements from settings
+        $minPasswordLength = Setting::getValue('min_password_length', 8);
+        $requireUppercase = Setting::getValue('require_uppercase', true);
+        $requireLowercase = Setting::getValue('require_lowercase', true);
+        $requireNumbers = Setting::getValue('require_numbers', true);
+        $requireSymbols = Setting::getValue('require_symbols', false);
+
+        // Build password validation rules
+        $passwordRules = ['required', 'string', "min:{$minPasswordLength}", 'confirmed'];
+
+        if ($requireUppercase) {
+            $passwordRules[] = 'regex:/[A-Z]/';
+        }
+        if ($requireLowercase) {
+            $passwordRules[] = 'regex:/[a-z]/';
+        }
+        if ($requireNumbers) {
+            $passwordRules[] = 'regex:/[0-9]/';
+        }
+        if ($requireSymbols) {
+            $passwordRules[] = 'regex:/[^A-Za-z0-9]/';
+        }
+
         $validator = Validator::make($request->all(), [
             'name' => 'required|string|max:255',
             'email' => 'required|string|email|max:255|unique:users',
-            'password' => 'required|string|min:8|confirmed',
+            'password' => $passwordRules,
         ]);
 
         if ($validator->fails()) {
@@ -38,14 +72,28 @@ class AuthController extends Controller
             'password' => Hash::make($request->password),
         ]);
 
-        // Send verification email
-        $user->sendEmailVerificationNotification();
+        // Check if email verification is required
+        $emailVerificationRequired = Setting::getValue('email_verification', true);
+
+        if ($emailVerificationRequired) {
+            // Send verification email
+            $user->sendEmailVerificationNotification();
+
+            $message = 'User registered successfully. Please check your email for verification.';
+        } else {
+            // Mark email as verified if verification is not required
+            $user->markEmailAsVerified();
+            $message = 'User registered successfully.';
+        }
+
+        // Log user registration
+        ActivityService::logUserRegistration($user);
 
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
             'status' => 'success',
-            'message' => 'User registered successfully. Please check your email for verification.',
+            'message' => $message,
             'data' => [
                 'user' => $user,
                 'token' => $token,
@@ -81,13 +129,17 @@ class AuthController extends Controller
 
         $user = User::where('email', $request->email)->firstOrFail();
 
-        // Check if email is verified
-        if (!$user->hasVerifiedEmail()) {
+        // Check if email verification is required and user is not verified
+        $emailVerificationRequired = Setting::getValue('email_verification', true);
+        if ($emailVerificationRequired && !$user->hasVerifiedEmail()) {
             return response()->json([
                 'status' => 'error',
                 'message' => 'Please verify your email address before logging in.'
             ], 403);
         }
+
+        // Log user login
+        ActivityService::logUserLogin($user, $request->ip());
 
         $token = $user->createToken('auth_token')->plainTextToken;
 

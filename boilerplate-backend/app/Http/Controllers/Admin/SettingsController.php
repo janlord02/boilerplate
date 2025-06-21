@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\Setting;
+use App\Services\ActivityService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
@@ -15,7 +16,7 @@ class SettingsController extends Controller
      */
     public function index(): JsonResponse
     {
-        $groups = ['general', 'security', 'email', 'notifications', 'advanced'];
+        $groups = ['general', 'security', 'email', 'notifications', 'advanced', 'theme'];
         $settings = [];
 
         foreach ($groups as $group) {
@@ -51,7 +52,7 @@ class SettingsController extends Controller
             'settings.*.key' => 'required|string',
             'settings.*.value' => 'nullable',
             'settings.*.type' => 'sometimes|string|in:string,boolean,integer,json',
-            'settings.*.group' => 'sometimes|string|in:general,security,email,notifications,advanced',
+            'settings.*.group' => 'sometimes|string|in:general,security,email,notifications,advanced,theme',
         ]);
 
         if ($validator->fails()) {
@@ -64,6 +65,7 @@ class SettingsController extends Controller
 
         $updatedSettings = [];
         $errors = [];
+        $changedSettings = [];
 
         foreach ($request->settings as $settingData) {
             try {
@@ -74,8 +76,22 @@ class SettingsController extends Controller
                     continue;
                 }
 
-                $setting->typed_value = $settingData['value'];
+                // Store old value for logging
+                $oldValue = $setting->typed_value;
+                $newValue = $settingData['value'];
+
+                $setting->typed_value = $newValue;
                 $setting->save();
+
+                // Track changed settings
+                if ($oldValue !== $newValue) {
+                    $changedSettings[] = [
+                        'key' => $setting->key,
+                        'old_value' => $oldValue,
+                        'new_value' => $newValue,
+                        'group' => $setting->group,
+                    ];
+                }
 
                 $updatedSettings[] = [
                     'key' => $setting->key,
@@ -86,6 +102,19 @@ class SettingsController extends Controller
             } catch (\Exception $e) {
                 $errors[] = "Failed to update setting '{$settingData['key']}': " . $e->getMessage();
             }
+        }
+
+        // Log settings changes if any were made
+        if (!empty($changedSettings)) {
+            ActivityService::logAdminAction(
+                $request->user(),
+                'Settings Updated',
+                "Admin updated " . count($changedSettings) . " settings",
+                [
+                    'changed_settings' => $changedSettings,
+                    'total_changed' => count($changedSettings),
+                ]
+            );
         }
 
         if (!empty($errors)) {
@@ -110,6 +139,17 @@ class SettingsController extends Controller
     public function reset(): JsonResponse
     {
         try {
+            // Log the reset action before clearing
+            ActivityService::logAdminAction(
+                request()->user(),
+                'Settings Reset',
+                'Admin reset all settings to defaults',
+                [
+                    'reset_by' => request()->user()->email,
+                    'timestamp' => now()->toISOString(),
+                ]
+            );
+
             // Clear all existing settings
             Setting::truncate();
 
@@ -138,6 +178,19 @@ class SettingsController extends Controller
         return response()->json([
             'status' => 'success',
             'data' => $settings,
+        ]);
+    }
+
+    /**
+     * Get theme settings (accessible to all authenticated users)
+     */
+    public function getThemeSettings(): JsonResponse
+    {
+        $themeSettings = Setting::getByGroup('theme');
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $themeSettings,
         ]);
     }
 
