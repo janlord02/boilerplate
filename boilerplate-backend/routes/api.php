@@ -25,7 +25,15 @@ use App\Http\Controllers\NotificationController as UserNotificationController;
 |
 */
 
-// Apply maintenance mode middleware to all routes
+// Critical routes that should work even in maintenance mode
+Route::middleware('auth:sanctum')->group(function () {
+    // User validation endpoint - must work in maintenance mode for super-admin bypass
+    Route::get('/user', function (Request $request) {
+        return $request->user();
+    });
+});
+
+// Apply maintenance mode middleware to all other routes
 Route::middleware('maintenance')->group(function () {
     // Public routes
     Route::post('/login', [AuthController::class, 'login']);
@@ -35,15 +43,30 @@ Route::middleware('maintenance')->group(function () {
     Route::post('/verify-email', [EmailVerificationController::class, 'verify']);
     Route::post('/resend-verification', [EmailVerificationController::class, 'resend']);
 
+    // 2FA verification routes (public - no auth required)
+    Route::post('/2fa/verify', [AuthController::class, 'verifyTwoFactor']);
+    Route::post('/2fa/resend', [AuthController::class, 'resendTwoFactorCode']);
+
+    // Test endpoint to verify cache is working
+    Route::get('/2fa/test-cache', function () {
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Cache system is working',
+            'data' => [
+                'cache_driver' => config('cache.default'),
+                'timestamp' => now()->timestamp,
+            ]
+        ]);
+    });
+
     // Public settings route
     Route::get('/settings/public', [SettingsController::class, 'getPublicSettings']);
 
+    // Public theme settings route
+    Route::get('/settings/theme/public', [SettingsController::class, 'getPublicThemeSettings']);
+
     // Protected routes
     Route::middleware('auth:sanctum')->group(function () {
-        Route::get('/user', function (Request $request) {
-            return $request->user();
-        });
-
         Route::post('/logout', [AuthController::class, 'logout']);
         Route::post('/refresh', [AuthController::class, 'refresh']);
         Route::put('/profile', [AuthController::class, 'updateProfile']);
@@ -100,6 +123,7 @@ Route::middleware('maintenance')->group(function () {
                 Route::get('/{group}', [SettingsController::class, 'getByGroup']);
                 Route::put('/', [SettingsController::class, 'update']);
                 Route::post('/reset', [SettingsController::class, 'reset']);
+                Route::post('/logo', [SettingsController::class, 'uploadLogo']);
             });
 
             // Logs routes
@@ -138,6 +162,7 @@ Route::middleware('maintenance')->group(function () {
             Route::post('/mark-all-read', [UserNotificationController::class, 'markAllAsRead']);
             Route::post('/push-subscription', [UserNotificationController::class, 'storePushSubscription']);
             Route::get('/push-subscription', [UserNotificationController::class, 'getPushSubscription']);
+            Route::delete('/push-subscription', [UserNotificationController::class, 'deletePushSubscription']);
             Route::post('/test-push', [UserNotificationController::class, 'testPushNotification']);
             Route::post('/test', [UserNotificationController::class, 'sendTestNotification']);
         });
