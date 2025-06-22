@@ -14,6 +14,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'role' => \App\Http\Middleware\RoleMiddleware::class,
             'maintenance' => \App\Http\Middleware\MaintenanceMode::class,
+            'api.session' => \App\Http\Middleware\EnsureApiSession::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

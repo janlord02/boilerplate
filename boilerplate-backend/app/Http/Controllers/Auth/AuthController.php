@@ -6,12 +6,16 @@ use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Models\Setting;
 use App\Services\ActivityService;
+use App\Mail\TwoFactorCodeMail;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Cache;
 
 class AuthController extends Controller
 {
@@ -108,50 +112,335 @@ class AuthController extends Controller
     public function login(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'email' => 'required|string|email',
+            'email' => 'required|email',
             'password' => 'required|string',
+            'remember' => 'boolean',
         ]);
 
         if ($validator->fails()) {
             return response()->json([
                 'status' => 'error',
                 'message' => 'Validation failed',
-                'errors' => $validator->errors()
+                'errors' => $validator->errors(),
             ], 422);
         }
 
-        if (!Auth::attempt($request->only('email', 'password'))) {
+        try {
+            $credentials = $request->only(['email', 'password']);
+            $remember = $request->boolean('remember', false);
+
+            if (!Auth::attempt($credentials, $remember)) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Invalid credentials',
+                ], 401);
+            }
+
+            $user = Auth::user();
+
+            // Check if user is verified
+            if (!$user->email_verified_at) {
+                Auth::logout();
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Please verify your email address before logging in.',
+                ], 403);
+            }
+
+            // Check if 2FA is enabled for the user
+            if ($user->two_factor_enabled) {
+                // Generate and send 2FA code
+                $code = $this->generateAndSendTwoFactorCode($user);
+
+                // Store 2FA data in cache for 2 minutes
+                $cacheKey = "2fa_{$user->id}_{$user->email}";
+                $cacheData = [
+                    'user_id' => $user->id,
+                    'code' => $code,
+                    'email' => $user->email,
+                    'created_at' => now()->timestamp,
+                ];
+
+                Cache::put($cacheKey, $cacheData, 120); // 2 minutes
+
+                Log::info('2FA cache created', [
+                    'user_id' => $user->id,
+                    'email' => $user->email,
+                    'cache_key' => $cacheKey,
+                    'cache_data' => $cacheData
+                ]);
+
+                return response()->json([
+                    'status' => 'success',
+                    'message' => '2FA code sent to your email',
+                    'data' => [
+                        'user' => [
+                            'id' => $user->id,
+                            'name' => $user->name,
+                            'email' => $user->email,
+                            'role' => $user->role,
+                        ],
+                        'requires_2fa' => true,
+                    ],
+                ]);
+            }
+
+            // Normal login flow
+            $token = $user->createToken('auth-token')->plainTextToken;
+            $refreshToken = $user->createToken('refresh-token')->plainTextToken;
+
+            // Log successful login
+            ActivityService::logUserLogin($user, $request->ip());
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Login successful',
+                'data' => [
+                    'user' => [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                        'email' => $user->email,
+                        'role' => $user->role,
+                        'avatar' => $user->avatar,
+                        'email_verified_at' => $user->email_verified_at,
+                        'two_factor_enabled' => $user->two_factor_enabled,
+                        'created_at' => $user->created_at,
+                        'updated_at' => $user->updated_at,
+                    ],
+                    'token' => $token,
+                    'refresh_token' => $refreshToken,
+                    'requires_2fa' => false,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Login error: ' . $e->getMessage());
             return response()->json([
                 'status' => 'error',
-                'message' => 'Invalid credentials'
-            ], 401);
+                'message' => 'Login failed. Please try again.',
+            ], 500);
         }
+    }
 
-        $user = User::where('email', $request->email)->firstOrFail();
-
-        // Check if email verification is required and user is not verified
-        $emailVerificationRequired = Setting::getValue('email_verification', true);
-        if ($emailVerificationRequired && !$user->hasVerifiedEmail()) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Please verify your email address before logging in.'
-            ], 403);
-        }
-
-        // Log user login
-        ActivityService::logUserLogin($user, $request->ip());
-
-        $token = $user->createToken('auth_token')->plainTextToken;
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Login successful',
-            'data' => [
-                'user' => $user,
-                'token' => $token,
-                'token_type' => 'Bearer'
-            ]
+    /**
+     * Verify 2FA code
+     */
+    public function verifyTwoFactor(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'code' => 'required|string|size:6',
+            'email' => 'required|email',
         ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $code = $request->input('code');
+            $email = $request->input('email');
+
+            // Find user by email
+            $user = User::where('email', $email)->first();
+            if (!$user) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'User not found.',
+                ], 404);
+            }
+
+            // Get stored 2FA data from cache
+            $cacheKey = "2fa_{$user->id}_{$email}";
+            $cachedData = Cache::get($cacheKey);
+
+            Log::info('2FA verification attempt', [
+                'user_id' => $user->id,
+                'email' => $email,
+                'has_cached_data' => !empty($cachedData),
+                'cache_key' => $cacheKey
+            ]);
+
+            if (!$cachedData) {
+                Log::warning('2FA cache missing data', [
+                    'user_id' => $user->id,
+                    'email' => $email,
+                    'cache_key' => $cacheKey
+                ]);
+                return response()->json([
+                    'status' => 'error',
+                    'message' => '2FA session expired. Please login again.',
+                ], 401);
+            }
+
+            // Check if cache is expired (2 minutes)
+            if ($cachedData['created_at'] && (now()->timestamp - $cachedData['created_at']) > 120) {
+                Log::warning('2FA cache expired', [
+                    'user_id' => $user->id,
+                    'created_at' => $cachedData['created_at'],
+                    'current_time' => now()->timestamp,
+                    'elapsed_seconds' => now()->timestamp - $cachedData['created_at']
+                ]);
+                Cache::forget($cacheKey);
+                return response()->json([
+                    'status' => 'error',
+                    'message' => '2FA session expired. Please login again.',
+                ], 401);
+            }
+
+            // Verify the code
+            if ($code !== $cachedData['code']) {
+                Log::warning('2FA code verification failed', [
+                    'user_id' => $user->id,
+                    'provided_code' => $code,
+                    'cached_code' => $cachedData['code']
+                ]);
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Invalid verification code.',
+                ], 401);
+            }
+
+            // Clear 2FA cache
+            Cache::forget($cacheKey);
+
+            // Complete login
+            Auth::login($user);
+            $token = $user->createToken('auth-token')->plainTextToken;
+            $refreshToken = $user->createToken('refresh-token')->plainTextToken;
+
+            // Log successful 2FA verification
+            ActivityService::logUserLogin($user, $request->ip());
+
+            Log::info('2FA verification successful', [
+                'user_id' => $user->id,
+                'email' => $user->email
+            ]);
+
+            return response()->json([
+                'status' => 'success',
+                'message' => '2FA verification successful',
+                'data' => [
+                    'user' => [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                        'email' => $user->email,
+                        'role' => $user->role,
+                        'avatar' => $user->avatar,
+                        'email_verified_at' => $user->email_verified_at,
+                        'two_factor_enabled' => $user->two_factor_enabled,
+                        'created_at' => $user->created_at,
+                        'updated_at' => $user->updated_at,
+                    ],
+                    'token' => $token,
+                    'refresh_token' => $refreshToken,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('2FA verification error: ' . $e->getMessage());
+            return response()->json([
+                'status' => 'error',
+                'message' => '2FA verification failed. Please try again.',
+            ], 500);
+        }
+    }
+
+    /**
+     * Resend 2FA code
+     */
+    public function resendTwoFactorCode(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $email = $request->input('email');
+
+            // Find user by email
+            $user = User::where('email', $email)->first();
+            if (!$user) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'User not found.',
+                ], 404);
+            }
+
+            // Check if there's existing 2FA cache for this user
+            $cacheKey = "2fa_{$user->id}_{$email}";
+            $existingData = Cache::get($cacheKey);
+
+            Log::info('2FA resend attempt', [
+                'user_id' => $user->id,
+                'email' => $email,
+                'has_existing_cache' => !empty($existingData)
+            ]);
+
+            if (!$existingData) {
+                Log::warning('2FA resend - no existing cache', [
+                    'user_id' => $user->id,
+                    'email' => $email
+                ]);
+                return response()->json([
+                    'status' => 'error',
+                    'message' => '2FA session expired. Please login again.',
+                ], 401);
+            }
+
+            // Generate and send new 2FA code
+            $code = $this->generateAndSendTwoFactorCode($user);
+
+            // Update cache with new code
+            $cacheData = [
+                'user_id' => $user->id,
+                'code' => $code,
+                'email' => $user->email,
+                'created_at' => now()->timestamp,
+            ];
+
+            Cache::put($cacheKey, $cacheData, 120); // 2 minutes
+
+            Log::info('2FA code resent successfully', [
+                'user_id' => $user->id,
+                'email' => $user->email,
+                'cache_key' => $cacheKey
+            ]);
+
+            return response()->json([
+                'status' => 'success',
+                'message' => '2FA code resent successfully',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Resend 2FA code error: ' . $e->getMessage());
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to resend 2FA code. Please try again.',
+            ], 500);
+        }
+    }
+
+    /**
+     * Generate and send 2FA code
+     */
+    private function generateAndSendTwoFactorCode(User $user): string
+    {
+        // Generate 6-digit code
+        $code = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+
+        // Send email with code
+        Mail::to($user->email)->send(new TwoFactorCodeMail($code, $user->name));
+
+        return $code;
     }
 
     /**
