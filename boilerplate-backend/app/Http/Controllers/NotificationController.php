@@ -176,6 +176,21 @@ class NotificationController extends Controller
     }
 
     /**
+     * Delete push subscription.
+     */
+    public function deletePushSubscription()
+    {
+        $user = Auth::user();
+
+        // Delete all push subscriptions for this user
+        $user->pushSubscriptions()->delete();
+
+        return response()->json([
+            'message' => 'Push subscription deleted successfully',
+        ]);
+    }
+
+    /**
      * Test push notification.
      */
     public function testPushNotification()

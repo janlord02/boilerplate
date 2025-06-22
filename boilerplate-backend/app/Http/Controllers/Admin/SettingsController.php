@@ -8,6 +8,7 @@ use App\Services\ActivityService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Log;
 
 class SettingsController extends Controller
 {
@@ -106,13 +107,23 @@ class SettingsController extends Controller
 
         // Log settings changes if any were made
         if (!empty($changedSettings)) {
+            // Create a more meaningful message
+            $settingNames = array_map(function ($setting) {
+                return ucfirst(str_replace('_', ' ', $setting['key']));
+            }, $changedSettings);
+
+            $message = count($changedSettings) === 1
+                ? "Updated setting: " . $settingNames[0]
+                : "Updated settings: " . implode(', ', $settingNames);
+
             ActivityService::logAdminAction(
                 $request->user(),
                 'Settings Updated',
-                "Admin updated " . count($changedSettings) . " settings",
+                $message,
                 [
                     'changed_settings' => $changedSettings,
                     'total_changed' => count($changedSettings),
+                    'setting_names' => $settingNames,
                 ]
             );
         }
@@ -195,6 +206,40 @@ class SettingsController extends Controller
     }
 
     /**
+     * Get public theme settings (no authentication required)
+     */
+    public function getPublicThemeSettings()
+    {
+        try {
+            $themeSettings = Setting::where('group', 'theme')
+                ->where('is_public', true)
+                ->get()
+                ->keyBy('key')
+                ->map(function ($setting) {
+                    return $setting->value;
+                });
+
+            // Also include the app logo from general settings
+            $appLogo = Setting::where('key', 'app_logo')->first();
+            if ($appLogo) {
+                $themeSettings['app_logo'] = $appLogo->value;
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $themeSettings,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get public theme settings: ' . $e->getMessage());
+
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to load theme settings',
+            ], 500);
+        }
+    }
+
+    /**
      * Insert default settings
      */
     private function insertDefaultSettings(): void
@@ -207,6 +252,14 @@ class SettingsController extends Controller
                 'type' => 'string',
                 'group' => 'general',
                 'description' => 'Application name displayed throughout the app',
+                'is_public' => true,
+            ],
+            [
+                'key' => 'app_logo',
+                'value' => null,
+                'type' => 'string',
+                'group' => 'general',
+                'description' => 'Application logo URL',
                 'is_public' => true,
             ],
             [
@@ -493,6 +546,61 @@ class SettingsController extends Controller
 
         foreach ($defaultSettings as $setting) {
             Setting::create($setting);
+        }
+    }
+
+    /**
+     * Upload application logo
+     */
+    public function uploadLogo(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'logo' => 'required|image|mimes:jpeg,png,jpg,gif,svg|max:2048',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            // Get the old logo URL for logging
+            $oldLogo = Setting::getValue('app_logo');
+
+            // Upload the new logo
+            $logoPath = $request->file('logo')->store('logos', 'public');
+            $logoUrl = asset('storage/' . $logoPath);
+
+            // Update the setting
+            Setting::setValue('app_logo', $logoUrl, 'string', 'general', 'Application logo URL');
+
+            // Log the logo upload
+            ActivityService::logAdminAction(
+                $request->user(),
+                'Logo Updated',
+                'Application logo was updated',
+                [
+                    'old_logo' => $oldLogo,
+                    'new_logo' => $logoUrl,
+                    'file_path' => $logoPath,
+                ]
+            );
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Logo uploaded successfully',
+                'data' => [
+                    'logo_url' => $logoUrl,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to upload logo: ' . $e->getMessage(),
+            ], 500);
         }
     }
 }
